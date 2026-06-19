@@ -1,2 +1,42 @@
 # Anikoto-cli
 This is a personal fork project to get something similar to ani-cli but use anikoto.cz as a source. This is a vibecoded project.
+
+This file makes use of the anikoto.cz API = https://megaplay.buzz/api
+This project was created by prompting claude, giving it data and providing feedback. I do not care if you make your own version as long as it is not a direct copy and reupload.
+
+For this to work I placed the file inside of my usr/local/bin file then ran anikoto-cli
+For more details on how to use this command please run anikoto-cli --help
+
+output:
+Usage: anikoto-cli [options] [query]
+
+Options:
+  -e, --episode <n>     Episode number or range (e.g. 3 or 5-10)
+  -m, --mode <m>        sub or dub (default: sub)
+  -d, --download        Download instead of playing
+  -c, --continue        Resume from history
+  -D, --delete          Clear history
+  -v, --vlc             Use VLC instead of mpv
+  -V, --version         Print version
+  -h, --help            This help
+
+Examples:
+  anikoto-cli clannad
+  anikoto-cli snafu
+  anikoto-cli -m dub -e 5 my hero academia
+  anikoto-cli -e 1-12 demon slayer
+  anikoto-cli -c
+
+More:
+You can also just run anikoto-cli {FLAG} 
+Prompt:
+Search anime: 
+Then enter your desired anime
+
+NOTE
+NOT WORKING!!!!!!
+Subtitles
+ani-cli menu to move to next episode, previous episode, quality etc...
+
+THIS IS A PASSION PROJECT
+I made this originally because I was unhappy with how there are no dub options on ani-cli anymore
