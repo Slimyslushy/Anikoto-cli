@@ -1,416 +1,345 @@
 #!/bin/sh
 # anikoto-cli — watch anime in mpv via AniList + megaplay.buzz
-# Dependencies: curl, fzf, mpv (or vlc)
+# Dependencies: curl, fzf, jq, mpv
 
-version_number="2.2.0"
+version="2.5.0"
 megaplay="https://megaplay.buzz"
 agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-
-# ── detect environment ────────────────────────────────────────────────────────
-is_termux() { [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; }
-
-# On Termux, ani-cli's trick: create a fake mpv shim that calls termux-open.
-# termux-open hands the URL to whatever Android app handles video (mpv-android,
-# VLC, etc.) — so no need to detect which app is installed.
-setup_termux_mpv() {
-    # Remove any old shim — we want the real termux mpv binary
-    shim="$PREFIX/bin/mpv"
-    if [ -f "$shim" ] && grep -q "am start\|termux-open" "$shim" 2>/dev/null; then
-        rm -f "$shim"
-        info "Removed old mpv shim — switching to Termux mpv binary."
-    fi
-    command -v mpv >/dev/null 2>&1 || die "mpv not found. Install it: pkg install mpv"
-}
-
-# Detect best available player
-detect_player() {
-    [ -n "$ANI_CLI_PLAYER" ] && { player="$ANI_CLI_PLAYER"; return; }
-
-    if is_termux; then
-        setup_termux_mpv
-        player="mpv"
-        return
-    fi
-
-    # Desktop: mpv > vlc > iina (macOS)
-    command -v mpv >/dev/null 2>&1 && player="mpv" && return
-    command -v vlc >/dev/null 2>&1 && player="vlc" && return
-    [ -e "/Applications/IINA.app/Contents/MacOS/iina-cli" ] \
-        && player="/Applications/IINA.app/Contents/MacOS/iina-cli" && return
-    die "No player found. Install mpv: sudo pacman -S mpv"
-}
-
-# ── defaults ──────────────────────────────────────────────────────────────────
 mode="${ANI_CLI_MODE:-sub}"
-player=""   # set by detect_player
+player="${ANI_CLI_PLAYER:-}"
 download_mode=0
 ep_range=""
 histfile="${XDG_STATE_HOME:-$HOME/.local/state}/anikoto-cli/history"
+configfile="${XDG_CONFIG_HOME:-$HOME/.config}/anikoto-cli/config"
+
+# ── download dir: built-in default < saved config < env var ─────────────────
+download_dir="$PWD"
+[ -f "$configfile" ] && . "$configfile" 2>/dev/null
+[ -n "$ANI_CLI_DOWNLOAD_DIR" ] && download_dir="$ANI_CLI_DOWNLOAD_DIR"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 die()  { printf "\033[1;31m%s\033[0m\n" "$*" >&2; exit 1; }
 info() { printf "\033[1;34m:: %s\033[0m\n" "$*" >&2; }
 ok()   { printf "\033[1;32m✓ %s\033[0m\n" "$*" >&2; }
+
 dep_ch() {
-    for dep; do command -v "$dep" >/dev/null || die "Missing: $dep"; done
+    for dep; do
+        command -v "$dep" >/dev/null || die "missing dependency: $dep"
+    done
 }
 
-# fzf launcher — display only column 1, but keep all columns as data
-# usage: launcher "Prompt" <num_display_cols>
 launcher() {
-    prompt="$1"
-    # --with-nth=1 shows only the first tab-separated field in fzf
-    # the full line (all fields) is still returned on selection
-    fzf --reverse --cycle --prompt "$prompt > " \
-        --with-nth=1 \
-        --delimiter=$'\t'
+    fzf --reverse --cycle --prompt "$1 > " --with-nth=1 --delimiter=$'\t'
+}
+
+detect_player() {
+    [ -n "$player" ] && return
+    command -v mpv  >/dev/null && player=mpv  && return
+    command -v vlc  >/dev/null && player=vlc  && return
+    [ -f "/Applications/IINA.app/Contents/MacOS/iina-cli" ] \
+        && player="/Applications/IINA.app/Contents/MacOS/iina-cli" && return
+    die "no player found — install mpv"
 }
 
 # ── help ──────────────────────────────────────────────────────────────────────
-help_info() {
-    printf "
-Usage: %s [options] [query]
+usage() {
+    cat << HELP
+usage: ${0##*/} [-h] [-V] [-d] [-v] [-c] [-D] [-m sub|dub] [-e NUM] [-o DIR] [query]
 
-Options:
-  -e, --episode <n>     Episode number or range (e.g. 3 or 5-10)
+options:
+  -e, --episode <n>     episode number or range (e.g. 3 or 1-12)
   -m, --mode <m>        sub or dub (default: sub)
-  -d, --download        Download instead of playing
-  -c, --continue        Resume from history
-  -D, --delete          Clear history
-  -v, --vlc             Use VLC instead of mpv
-  -V, --version         Print version
-  -h, --help            This help
+  -o, --output <dir>    download directory; saved as the default — run with
+                         just -o (no query) to update it without playing
+  -d, --download        download instead of playing
+  -c, --continue        resume from history
+  -D, --delete          clear history
+  -v, --vlc             use vlc
+  -V, --version         print version
+  -h, --help            this help
 
-Controls after each episode:
-  n = next  p = prev  r = replay  q = quit  [Enter] = next
+environment:
+  ANI_CLI_MODE          default mode (sub/dub)
+  ANI_CLI_PLAYER        player command
+  ANI_CLI_DOWNLOAD_DIR  override download directory (takes priority over saved default)
 
-Examples:
-  %s clannad
-  %s snafu
-  %s -m dub -e 5 my hero academia
-  %s -e 1-12 demon slayer
-  %s -c
-\n" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}"
+after each episode: pick Next / Replay / Previous / Quit from the menu
+HELP
     exit 0
 }
 
 # ── history ───────────────────────────────────────────────────────────────────
+save_download_dir() {
+    mkdir -p "$(dirname "$configfile")"
+    esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+    printf "download_dir='%s'\n" "$esc" > "$configfile"
+}
+
 save_history() {
-    # fields: mal_id|title|last_ep|mode|total_eps
     mkdir -p "$(dirname "$histfile")"
     tmp=$(mktemp)
-    grep -v "^${1}|" "$histfile" 2>/dev/null > "$tmp" || true
-    printf "%s|%s|%s|%s|%s\n" "$1" "$2" "$3" "$4" "$5" | cat - "$tmp" > "$histfile"
+    grep -v "^${1}|" "$histfile" 2>/dev/null > "$tmp" || :
+    printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" | cat - "$tmp" > "$histfile"
     rm -f "$tmp"
 }
 
-pick_from_history() {
-    [ -f "$histfile" ] || die "No history yet."
-    # display: "Title — ep3 [sub]" but return full line
-    entry=$(awk -F'|' '{printf "%s — ep%s [%s]\t%s\t%s\t%s\n", $2, $3, $4, $1, $5, $4}' "$histfile" \
-        | launcher "Resume")
-    [ -z "$entry" ] && die "Nothing selected."
-    printf '%s' "$entry"
+load_history() {
+    [ -f "$histfile" ] || die "no history found"
+    awk -F'|' '{printf "%s — ep%s [%s]\t%s\t%s\t%s\n", $2,$3,$4,$1,$5,$4}' "$histfile" \
+        | launcher "resume"
 }
 
-# ── step 1: search AniList ────────────────────────────────────────────────────
+# ── search ────────────────────────────────────────────────────────────────────
 search_anilist() {
-    safe=$(printf '%s' "$1" | sed 's/"/\\"/g')
+    query=$(printf '%s' "$1" | sed 's/"/\\"/g')
     curl -s -X POST "https://graphql.anilist.co" \
         -H "Content-Type: application/json" \
-        --data-raw "{\"query\":\"query{Page(perPage:20){media(search:\\\"${safe}\\\",type:ANIME,sort:SEARCH_MATCH){title{english romaji}idMal episodes}}}\"}" \
-        | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    for item in d['data']['Page']['media']:
-        eng   = item['title'].get('english') or ''
-        rom   = item['title'].get('romaji')  or ''
-        title = eng if eng else rom
-        mal   = item.get('idMal') or ''
-        eps   = item.get('episodes') or '?'
-        # col1 = display label, col2 = mal_id, col3 = eps
-        print(f'{title}  ({eps} eps)\t{mal}\t{eps}')
-except Exception as e:
-    print(f'AniList error: {e}', file=sys.stderr)
-"
+        -d "{\"query\":\"query{Page(perPage:20){media(search:\\\"${query}\\\",type:ANIME,sort:SEARCH_MATCH){title{english romaji}idMal episodes}}}\"}" \
+    | jq -r '
+        .data.Page.media[] |
+        (.title.english // .title.romaji) as $t |
+        (.episodes // "?") as $e |
+        (.idMal // "") as $id |
+        "\($t)  (\($e) eps)\t\($id)\t\($e)"
+    '
 }
 
-# ── step 2: get stream + subtitles from megaplay ──────────────────────────────
-# Outputs lines:
-#   stream <url>
-#   sub <label> <url>
-#   sub <label> <url>  (one per subtitle track)
+# ── sources ───────────────────────────────────────────────────────────────────
+# outputs:
+#   stream\t<url>
+#   sub\t<label>\t<url>
 get_sources() {
-    mal_id="$1"
-    ep_num="$2"
-    lang="$3"
+    mal_id=$1 ep=$2 lang=$3
 
-    embed_url="${megaplay}/stream/mal/${mal_id}/${ep_num}/${lang}"
+    html=$(curl -s -A "$agent" -H "Referer: ${megaplay}/" \
+        "${megaplay}/stream/mal/${mal_id}/${ep}/${lang}")
 
-    html=$(curl -s -A "$agent" \
-        -H "Referer: ${megaplay}/" \
-        "$embed_url")
-
-    # extract numeric source id — try multiple patterns
-    id=$(printf '%s' "$html" | grep -oE 'data-id="[0-9]+"' | head -1 | grep -oE '[0-9]+')
-    [ -z "$id" ] && id=$(printf '%s' "$html" \
-        | grep -oE '"id"\s*:\s*"?[0-9]+"?' | head -1 | grep -oE '[0-9]+')
+    id=$(printf '%s' "$html" | grep -oE 'data-id="[0-9]+"' | grep -oE '[0-9]+' | head -1)
     [ -z "$id" ] && return 1
 
-    sources=$(curl -s -A "$agent" \
-        -H "Referer: ${megaplay}/" \
-        "${megaplay}/stream/getSources?id=${id}")
+    curl -s -A "$agent" -H "Referer: ${megaplay}/" \
+        "${megaplay}/stream/getSources?id=${id}" \
+    | jq -r '
+        ( if .sources | type == "array" then .sources[0].file
+          elif .sources | type == "object" then .sources.file
+          else "" end
+        ) as $url
+        | (if $url != "" then "stream\t\($url)" else empty end),
 
-    printf '%s' "$sources" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-
-    # ── stream URL ──
-    src = d.get('sources', {})
-    if isinstance(src, dict):
-        url = src.get('file', '')
-    elif isinstance(src, list) and src:
-        url = src[0].get('file', '')
-    else:
-        url = ''
-    if url:
-        print(f'stream\t{url}')
-
-    # ── subtitle tracks ──
-    # field may be 'tracks', 'captions', 'subtitles'
-    for key in ('tracks', 'captions', 'subtitles'):
-        tracks = d.get(key, [])
-        if tracks:
-            break
-    for track in tracks:
-        if not isinstance(track, dict):
-            continue
-        kind  = track.get('kind', track.get('type', '')).lower()
-        label = track.get('label', track.get('title', 'Unknown'))
-        turl  = track.get('file', track.get('src', track.get('url', '')))
-        if turl and kind in ('captions', 'subtitles', 'sub', ''):
-            # sanitise label for shell safety
-            label = label.replace('\t', ' ').replace('\n', ' ')
-            print(f'sub\t{label}\t{turl}')
-except Exception as e:
-    print(f'parse error: {e}', file=sys.stderr)
-"
+        ( ( ( if (.tracks    | length // 0) > 0 then .tracks
+              elif (.captions  | length // 0) > 0 then .captions
+              elif (.subtitles | length // 0) > 0 then .subtitles
+              else [] end
+            )[] ) |
+          select((.file // .src // .url) != null) |
+          select((.kind // .type // "") | ascii_downcase |
+                 test("caption|subtitle|sub|^$")) |
+          "sub\t\(.label // .title // "Unknown")\t\(.file // .src // .url)"
+        )
+    ' 2>/dev/null
 }
 
-# ── step 3: play or download ──────────────────────────────────────────────────
+get_sub_url() {
+    printf '%s' "$1" | awk -F'\t' '
+        /^sub/ {
+            label = tolower($2)
+            if (!first) first = $3
+            if (label ~ /^english[ \t]*$/) {
+                if (score < 3) { best = $3; score = 3 }
+            } else if (label ~ /eng/ && label !~ /sign|song/) {
+                if (score < 2) { best = $3; score = 2 }
+            } else if (label ~ /eng/) {
+                if (score < 1) { best = $3; score = 1 }
+            }
+        }
+        END { print (best ? best : first) }
+    '
+}
+
+# ── playback ──────────────────────────────────────────────────────────────────
 play_episode() {
-    m3u8="$1"
-    title="$2"
-    sub_url="$3"   # optional subtitle URL (not a flag, just the raw URL)
+    url=$1 title=$2 sub=$3
 
-    if [ "$download_mode" = "1" ]; then
-        out="$(printf '%s' "$title" | tr ' /' '_-' | tr -dc 'A-Za-z0-9_.-').mp4"
-        info "Downloading: $out"
-        curl -L -A "$agent" -H "Referer: ${megaplay}/" --progress-bar -o "$out" "$m3u8"
-        ok "Saved: $out"
-        return
-    fi
+    if [ "$download_mode" = 1 ]; then
+    mkdir -p "$download_dir"
 
-    info "Playing with: $player"
+    out="${download_dir}/$(printf '%s' "$title" | tr ' /' '_-' | tr -dc 'A-Za-z0-9_.-').mp4"
+
+    info "downloading to: $out"
+
+    ffmpeg \
+        -user_agent "$agent" \
+        -headers "Referer: ${megaplay}/\r\n" \
+        -i "$url" \
+        -c copy \
+        -y \
+        "$out"
+
+    [ $? -eq 0 ] && ok "saved: $out"
+    return
+fi
 
     case "$player" in
         *vlc*)
-            sub_arg=""
-            [ -n "$sub_url" ] && sub_arg="--sub-file=${sub_url}"
-            $player --http-referrer="${megaplay}/" $sub_arg "$m3u8"
+            set -- --http-referrer="${megaplay}/"
+            [ -n "$sub" ] && set -- "$@" --sub-file="$sub"
+            $player "$@" "$url"
             ;;
         *iina*)
-            sub_arg=""
-            [ -n "$sub_url" ] && sub_arg="--mpv-sub-file=${sub_url}"
-            $player --mpv-referrer="${megaplay}/" $sub_arg "$m3u8"
+            set -- --mpv-referrer="${megaplay}/"
+            [ -n "$sub" ] && set -- "$@" --mpv-sub-file="$sub"
+            $player "$@" "$url"
             ;;
         *)
-            # mpv — desktop or Termux shim (shim ignores flags, passes URL to termux-open)
-            sub_arg=""
-            [ -n "$sub_url" ] && sub_arg="--sub-file=${sub_url}"
-            $player \
-                --referrer="${megaplay}/" \
-                --title="$title" \
-                --force-media-title="$title" \
-                $sub_arg \
-                "$m3u8"
+            set -- --referrer="${megaplay}/" --force-media-title="$title"
+            [ -n "$sub" ] && set -- "$@" --sub-file="$sub"
+            $player "$@" "$url"
             ;;
     esac
 }
 
-# ── pick best subtitle URL ────────────────────────────────────────────────────
-# reads "sub <label> <url>" lines, returns the raw URL of the best track
-get_sub_url() {
-    sub_lines=$(printf '%s' "$1" | grep '^sub')
-    [ -z "$sub_lines" ] && return
-    # prefer English, then first available
-    eng=$(printf '%s' "$sub_lines" | awk -F'\t' 'tolower($2) ~ /eng/{print $3;exit}')
-    first=$(printf '%s' "$sub_lines" | awk -F'\t' 'NR==1{print $3}')
-    printf '%s' "${eng:-$first}"
-}
-
-# ── interactive post-episode prompt ──────────────────────────────────────────
-# Returns: next / prev / replay / quit
-episode_prompt() {
-    cur="$1"; total="$2"
-    printf "\n\033[1;36m"
-    printf "  [n] next  [p] prev  [r] replay  [q] quit  [Enter] next\n"
-    printf "  Episode %s / %s > \033[0m" "$cur" "${total:-?}"
-    read -r choice
-    case "$choice" in
-        p|prev)   printf "prev"   ;;
-        r|replay) printf "replay" ;;
-        q|quit)   printf "quit"   ;;
-        *)        printf "next"   ;;  # enter or n
-    esac
+# ── post-episode prompt ───────────────────────────────────────────────────────
+ep_prompt() {
+    sel=$(printf 'Next Episode\tnext\nReplay Episode\treplay\nPrevious Episode\tprev\nQuit\tquit\n' \
+        | launcher "episode ${1}/${2:-?}")
+    action=$(printf '%s' "$sel" | cut -f2)
+    printf '%s' "${action:-quit}"
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
 main() {
-    dep_ch curl fzf python3
+    dep_ch curl fzf jq ffmpeg
     detect_player
 
-    query=""; from_history=0
+    query='' from_history=0 output_set=0
 
     while [ $# -gt 0 ]; do
-        case "$1" in
-            -h|--help)     help_info ;;
-            -V|--version)  printf "%s\n" "$version_number"; exit 0 ;;
-            -d|--download) download_mode=1 ;;
-            -v|--vlc)      player="vlc" ;;
-            -c|--continue) from_history=1 ;;
-            -D|--delete)   rm -f "$histfile" && printf "History cleared.\n" && exit 0 ;;
-            -m|--mode)     shift; mode="$1" ;;
-            -e|--episode|-r|--range) shift; ep_range="$1" ;;
-            --dub) mode="dub" ;; --sub) mode="sub" ;;
-            -*) die "Unknown option: $1" ;;
-            *)  query="${query:+$query }$1" ;;
+        case $1 in
+            -h|--help)               usage ;;
+            -V|--version)            printf '%s\n' "$version"; exit 0 ;;
+            -d|--download)           download_mode=1 ;;
+            -v|--vlc)                player=vlc ;;
+            -c|--continue)           from_history=1 ;;
+            -D|--delete)             rm -f "$histfile"; printf 'history cleared\n'; exit 0 ;;
+            -m|--mode)               shift; mode=$1 ;;
+            -e|--episode|-r|--range) shift; ep_range=$1 ;;
+            -o|--output)             shift; download_dir=$1; output_set=1 ;;
+            --dub)                   mode=dub ;;
+            --sub)                   mode=sub ;;
+            -*)                      die "unknown option: $1" ;;
+            *)                       query="${query:+$query }$1" ;;
         esac
         shift
     done
 
-    # ── pick series ───────────────────────────────────────────────────────────
-    if [ "$from_history" = "1" ]; then
-        raw=$(pick_from_history)
-        # cols: display\tmal_id\ttotal_eps\tmode
-        mal_id=$(    printf '%s' "$raw" | cut -f2)
-        total_eps=$( printf '%s' "$raw" | cut -f3)
-        mode=$(      printf '%s' "$raw" | cut -f4)
+    # ── download directory update ─────────────────────────────────────────────
+    if [ "$output_set" = 1 ]; then
+        mkdir -p "$download_dir" || die "could not create directory: $download_dir"
+        save_download_dir "$download_dir"
+        if [ -z "$query" ] && [ "$from_history" = 0 ]; then
+            ok "default download directory updated: $download_dir"
+            exit 0
+        fi
+    fi
+
+    # ── series selection ──────────────────────────────────────────────────────
+    if [ "$from_history" = 1 ]; then
+        raw=$(load_history)
+        [ -z "$raw" ] && die "nothing selected"
+        mal_id=$(   printf '%s' "$raw" | cut -f2)
+        total_eps=$(printf '%s' "$raw" | cut -f3)
+        mode=$(     printf '%s' "$raw" | cut -f4)
         series_title=$(awk -F'|' -v m="$mal_id" '$1==m{print $2;exit}' "$histfile")
-        last_ep=$(   awk -F'|' -v m="$mal_id" '$1==m{print $3;exit}' "$histfile")
-        [ -z "$ep_range" ] && ep_range="$last_ep-$last_ep"
+        last_ep=$(  awk -F'|' -v m="$mal_id" '$1==m{print $3;exit}' "$histfile")
+        [ -z "$ep_range" ] && ep_range="${last_ep}-${last_ep}"
     else
-        [ -z "$query" ] && printf "Search anime: " && read -r query
-        [ -z "$query" ] && die "No query given."
+        [ -z "$query" ] && printf 'search anime: ' && read -r query
+        [ -z "$query" ] && die "no query given"
 
-        info "Searching: $query"
         results=$(search_anilist "$query")
-        [ -z "$results" ] && die "No results for: $query"
+        [ -z "$results" ] && die "no results for: $query"
 
-        # fzf shows "Title (N eps)" only; full line has tabs with mal_id and eps
-        selected=$(printf '%s' "$results" | launcher "Select anime")
-        [ -z "$selected" ] && die "Nothing selected."
+        selected=$(printf '%s' "$results" | launcher "select anime")
+        [ -z "$selected" ] && die "nothing selected"
 
-        # col1=display_title, col2=mal_id, col3=eps
         series_title=$(printf '%s' "$selected" | cut -f1 | sed 's/  ([0-9?]* eps)$//')
         mal_id=$(      printf '%s' "$selected" | cut -f2)
         total_eps=$(   printf '%s' "$selected" | cut -f3)
 
-        { [ -z "$mal_id" ] || [ "$mal_id" = "None" ]; } && \
-            die "No MAL ID for '$series_title'."
+        { [ -z "$mal_id" ] || [ "$mal_id" = 'null' ]; } \
+            && die "no MAL id for '$series_title' — can't stream"
     fi
 
-    info "▶ $series_title  (MAL: $mal_id  |  $total_eps eps  |  $mode)"
+    info "$series_title  (mal:$mal_id  eps:$total_eps  $mode)"
 
-    # ── select starting episode ───────────────────────────────────────────────
+    # ── episode selection ─────────────────────────────────────────────────────
     if [ -z "$ep_range" ]; then
-        if [ "$total_eps" = "?" ] || [ -z "$total_eps" ]; then
-            printf "Episode (or range e.g. 1-12): " && read -r ep_range
-            [ -z "$ep_range" ] && die "No episode given."
-            ep_clean=$(printf '%s' "$ep_range" | tr ' ' '-')
-            ep_start=$(printf '%s' "$ep_clean" | cut -d'-' -f1)
-            ep_end=$(  printf '%s' "$ep_clean" | cut -d'-' -f2)
+        if [ "$total_eps" = '?' ] || [ -z "$total_eps" ]; then
+            printf 'episode (or range, e.g. 1-12): '
+            read -r ep_range
+            [ -z "$ep_range" ] && die "no episode given"
         else
-            # show numbered episode list in fzf
             ep_num=$(seq 1 "$total_eps" \
-                | awk '{printf "Episode %s\t%s\n", $1, $1}' \
-                | launcher "Select episode" \
+                | awk '{printf "episode %s\t%s\n",$1,$1}' \
+                | launcher "select episode" \
                 | cut -f2)
-            [ -z "$ep_num" ] && die "Nothing selected."
-            ep_start="$ep_num"
-            ep_end="$ep_num"
-            # if user wants a range, they can use -e flag; single pick plays one then prompts
+            [ -z "$ep_num" ] && die "nothing selected"
+            ep_start=$ep_num ep_end=$ep_num
         fi
-    else
-        ep_clean=$(printf '%s' "$ep_range" | tr ' ' '-')
-        ep_start=$(printf '%s' "$ep_clean" | cut -d'-' -f1)
-        ep_end=$(  printf '%s' "$ep_clean" | cut -d'-' -f2)
-        [ "$ep_end" = "$ep_start" ] && ep_end="$ep_start"
+    fi
+
+    if [ -z "${ep_start:-}" ]; then
+        ep_range=$(printf '%s' "$ep_range" | tr ' ' '-')
+        ep_start=$(printf '%s' "$ep_range" | cut -d- -f1)
+        ep_end=$(  printf '%s' "$ep_range" | cut -d- -f2)
     fi
 
     # ── playback loop ─────────────────────────────────────────────────────────
-    ep_num="$ep_start"
-    while true; do
-        # bounds check
+    ep_num=$ep_start
+    while :; do
         [ "$ep_num" -lt 1 ] && ep_num=1
-        if [ -n "$total_eps" ] && [ "$total_eps" != "?" ]; then
-            [ "$ep_num" -gt "$total_eps" ] && ok "Reached end of series." && break
-        fi
-        # respect explicit end if set via -e range
-        [ -n "$ep_end" ] && [ "$ep_num" -gt "$ep_end" ] && break
+        [ -n "$total_eps" ] && [ "$total_eps" != '?' ] \
+            && [ "$ep_num" -gt "$total_eps" ] && ok "end of series" && break
+        [ "$download_mode" = 1 ] && [ "$ep_num" -gt "$ep_end" ] && break
 
-        ep_label="${series_title} — Episode ${ep_num} [${mode}]"
-        info "→ $ep_label"
+        label="${series_title} — episode ${ep_num} [${mode}]"
+        info "→ $label"
 
-        # get stream + subtitles
-        sources_out=$(get_sources "$mal_id" "$ep_num" "$mode")
+        sources=$(get_sources "$mal_id" "$ep_num" "$mode")
 
-        if [ -z "$sources_out" ]; then
-            other_mode="dub"; [ "$mode" = "dub" ] && other_mode="sub"
-            info "No $mode stream, trying $other_mode..."
-            sources_out=$(get_sources "$mal_id" "$ep_num" "$other_mode")
-            [ -z "$sources_out" ] && die "No stream found for episode $ep_num."
-            printf "\033[1;33mFalling back to %s\033[0m\n" "$other_mode" >&2
+        if [ -z "$sources" ] || ! printf '%s' "$sources" | grep -q '^stream'; then
+            other=$([ "$mode" = dub ] && printf sub || printf dub)
+            info "no $mode stream — trying $other"
+            sources=$(get_sources "$mal_id" "$ep_num" "$other")
+            { [ -z "$sources" ] || ! printf '%s' "$sources" | grep -q '^stream'; } \
+                && die "no stream for episode $ep_num"
+            printf '\033[1;33mwarning: using %s\033[0m\n' "$other" >&2
         fi
 
-        m3u8=$(printf '%s' "$sources_out" | awk -F'\t' '/^stream/{print $2;exit}')
-        [ -z "$m3u8" ] && die "Could not extract stream URL for episode $ep_num."
+        stream=$(printf '%s' "$sources" | awk -F'\t' '/^stream/{print $2;exit}')
+        [ -z "$stream" ] && die "could not parse stream url"
 
-        # build subtitle arg (--sub-file=... or empty)
-        sub_url=$(get_sub_url "$sources_out")
+        sub=$(get_sub_url "$sources")
 
-        # show found subtitles
-        sub_count=$(printf '%s' "$sources_out" | grep -c '^sub' || true)
-        if [ "$sub_count" -gt 0 ]; then
-            ok "Found $sub_count subtitle track(s)."
-            printf '%s' "$sources_out" | grep '^sub' | awk -F'\t' '{printf "   %s\n", $2}' >&2
-        fi
+        n_subs=$(printf '%s' "$sources" | grep -c '^sub' || :)
+        [ "$n_subs" -gt 0 ] && ok "$n_subs subtitle track(s)" \
+            && printf '%s' "$sources" | awk -F'\t' '/^sub/{printf "   %s\n",$2}' >&2
 
-        sub_url=$(get_sub_url "$sources_out")
-
-        ok "Stream ready."
-        play_episode "$m3u8" "$ep_label" "$sub_url"
-
+        play_episode "$stream" "$label" "$sub"
         save_history "$mal_id" "$series_title" "$ep_num" "$mode" "${total_eps:-?}"
 
-        # ── post-episode menu ──
-        if [ "$download_mode" = "1" ]; then
-            ep_num=$((ep_num + 1))
-            continue
-        fi
+        [ "$download_mode" = 1 ] && { ep_num=$((ep_num+1)); continue; }
 
-        action=$(episode_prompt "$ep_num" "$total_eps")
-        case "$action" in
-            next)   ep_num=$((ep_num + 1)) ;;
-            prev)   ep_num=$((ep_num - 1)) ;;
-            replay) : ;;   # ep_num unchanged = replay
+        action=$(ep_prompt "$ep_num" "$total_eps")
+        case $action in
+            next)   ep_num=$((ep_num+1)) ;;
+            prev)   ep_num=$((ep_num-1)) ;;
+            replay) : ;;
             quit)   break ;;
         esac
     done
 
-    ok "Done."
+    ok "done"
 }
 
 main "$@"
