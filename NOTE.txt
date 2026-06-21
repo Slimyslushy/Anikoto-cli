@@ -8,24 +8,37 @@ For this to work I placed the file inside of my usr/local/bin file then ran anik
 For more details on how to use this command please run anikoto-cli --help
 
 output:
-Usage: anikoto-cli [options] [query]
 
-Options:
-  -e, --episode <n>     Episode number or range (e.g. 3 or 5-10)
+options:
+  -e, --episode <n>     episode number or range (e.g. 3 or 1-12)
   -m, --mode <m>        sub or dub (default: sub)
-  -d, --download        Download instead of playing
-  -c, --continue        Resume from history
-  -D, --delete          Clear history
-  -v, --vlc             Use VLC instead of mpv
-  -V, --version         Print version
-  -h, --help            This help
+  -o, --output <dir>    download directory; saved as the default — run with
+                         just -o (no query) to update it without playing
+  -d, --download        download instead of playing
+  -c, --continue        resume from history
+  -D, --delete          clear history
+  -v, --vlc             use vlc
+  -V, --version         print version
+  -h, --help            this help
 
-Examples:
-  anikoto-cli clannad
-  anikoto-cli snafu
-  anikoto-cli -m dub -e 5 my hero academia
-  anikoto-cli -e 1-12 demon slayer
-  anikoto-cli -c
+environment:
+  ANI_CLI_MODE          default mode (sub/dub)
+  ANI_CLI_PLAYER        player command
+  ANI_CLI_DOWNLOAD_DIR  override download directory (takes priority over saved default)
+
+after each episode: pick Next / Replay / Previous / Quit from the menu
+
+Downloading info:
+Not working but the syntax to use it is as follows:
+anikoto-cli -d
+
+Changing default donwload location:
+usage is as follows:
+anikoto-cli -o {location}
+example:
+anikoto-cli -o /home/peter/Downloads
+
+// my name is not peter
 
 More:
 You can also just run anikoto-cli {FLAG} 
@@ -35,7 +48,8 @@ Then enter your desired anime
 
 NOTE
 NOT WORKING!!!!!!
-ani-cli menu to move to next episode, previous episode, quality etc...
+changing quality or source
+cannot download any content
 
 THIS IS A PASSION PROJECT
 I made this originally because I was unhappy with how there are no dub options on ani-cli anymore
