@@ -1,6 +1,6 @@
 #!/bin/sh
 # anikoto-cli — watch anime in mpv via AniList + megaplay.buzz
-# Dependencies: curl, fzf, jq, mpv
+# Dependencies: curl, fzf, jq, mpv, ffmpeg
 
 version="2.5.0"
 megaplay="https://megaplay.buzz"
